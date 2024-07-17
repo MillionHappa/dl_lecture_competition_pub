@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Dict, Any
 import os
 import time
+from torch import nn
+import torch.nn.functional as F
 
 
 class RepresentationType(Enum):
@@ -27,14 +29,15 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
     np.random.seed(seed)
 
-def compute_epe_error(pred_flow: torch.Tensor, gt_flow: torch.Tensor):
-    '''
-    end-point-error (ground truthと予測値の二乗誤差)を計算
-    pred_flow: torch.Tensor, Shape: torch.Size([B, 2, 480, 640]) => 予測したオプティカルフローデータ
-    gt_flow: torch.Tensor, Shape: torch.Size([B, 2, 480, 640]) => 正解のオプティカルフローデータ
-    '''
-    epe = torch.mean(torch.mean(torch.norm(pred_flow - gt_flow, p=2, dim=1), dim=(1, 2)), dim=0)
-    return epe
+def compute_epe_error(pred_flow: Dict[str, torch.Tensor], gt_flow):
+    loss_total=0
+    weights = {'flow0': 0.1, 'flow1': 0.15, 'flow2': 0.2, 'flow3': 0.55}
+    for i in range(len(pred_flow)):
+        flow = pred_flow["flow{}".format(i)]
+        gt_flow_i=gt_flow[i]
+        epe = torch.mean(torch.mean(torch.norm(flow - gt_flow_i, p=2, dim=1), dim=(1, 2)), dim=0)
+        loss_total += epe * weights[f"flow{i}"]
+    return loss_total
 
 def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
     '''
@@ -43,6 +46,10 @@ def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
     file_name: str => ファイル名
     '''
     np.save(f"{file_name}.npy", flow.cpu().numpy())
+
+def resize_flow(flow, size):
+    return F.interpolate(flow, size=size, mode='bilinear', align_corners=True)
+
 
 @hydra.main(version_base=None, config_path="configs", config_name="base")
 def main(args: DictConfig):
@@ -115,7 +122,7 @@ def main(args: DictConfig):
     # ------------------
     #   optimizer
     # ------------------
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.train.initial_learning_rate, weight_decay=args.train.weight_decay)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0001)
     # ------------------
     #   Start training
     # ------------------
@@ -127,12 +134,19 @@ def main(args: DictConfig):
             batch: Dict[str, Any]
             event_image = batch["event_volume"].to(device) # [B, 4, 480, 640]
             ground_truth_flow = batch["flow_gt"].to(device) # [B, 2, 480, 640]
-            flow = model(event_image) # [B, 2, 480, 640]
-            loss: torch.Tensor = compute_epe_error(flow, ground_truth_flow)
+            resized_flows = [
+                resize_flow(ground_truth_flow, size=(60, 80)),
+                resize_flow(ground_truth_flow, size=(120, 160)),
+                resize_flow(ground_truth_flow, size=(240, 320)),
+                ground_truth_flow  # 最終スケールはリサイズ不要
+            ]
+            flow_dict = model(event_image) # [B, 2, 480, 640]
+            loss: torch.Tensor = compute_epe_error(flow_dict, resized_flows)
             print(f"batch {i} loss: {loss.item()}")
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            
+            optimizer.zero_grad()#誤差の逆伝播
+            loss.backward()            
+            optimizer.step() #パラメーターの更新
 
             total_loss += loss.item()
         print(f'Epoch {epoch+1}, Loss: {total_loss / len(train_data)}')
@@ -157,7 +171,8 @@ def main(args: DictConfig):
         for batch in tqdm(test_data):
             batch: Dict[str, Any]
             event_image = batch["event_volume"].to(device)
-            batch_flow = model(event_image) # [1, 2, 480, 640]
+            batch_flow_dict = model(event_image)  # 中間層からの出力を含む辞書を取得
+            batch_flow = batch_flow_dict['flow3']  # 最終層のフローを取得
             flow = torch.cat((flow, batch_flow), dim=0)  # [N, 2, 480, 640]
         print("test done")
     # ------------------
